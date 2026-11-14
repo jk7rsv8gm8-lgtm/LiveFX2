@@ -7,13 +7,16 @@ static const float kDlBeats[4]   = { 1.f, 0.5f, 0.75f, 0.25f };   // 1/4, 1/8, 1
 static const float kSeqBeats[4]  = { 1.f, 0.5f, 0.25f, 0.125f };  // 1/4, 1/8, 1/16, 1/32
 static const float kStutBeats[4] = { 1.f, 0.5f, 0.25f, 0.125f };
 
+enum { SmOneShot, SmGate, SmLoop, SmPitched };
+static const int kDefKeys[kSlots] = { 48, 50, 52, 53, 55, 57, 59, 60 };   // default key per slot (white keys)
+
 static AudioProcessorValueTreeState::ParameterLayout createLayout()
 {
     AudioProcessorValueTreeState::ParameterLayout l;
 
     for (auto& p : kParams)
     {
-        NormalisableRange<float> r (p.lo, p.hi);
+        NormalisableRange<float> r (p.lo, p.hi, String (p.id) == "seqLen" ? 1.f : 0.f);
         if (p.mid > 0.f) r.setSkewForCentre (p.mid);
         l.add (std::make_unique<AudioParameterFloat> (ParameterID { p.id, 1 }, p.name, r, p.def));
     }
@@ -29,6 +32,20 @@ static AudioProcessorValueTreeState::ParameterLayout createLayout()
     l.add (std::make_unique<AudioParameterBool> (ParameterID { "seqOn", 1 },     "Sequencer On", false));
     l.add (std::make_unique<AudioParameterBool> (ParameterID { "keysPitch", 1 }, "Keys To Grain Pitch", false));
     l.add (std::make_unique<AudioParameterBool> (ParameterID { "loopRev", 1 },   "Loop Reverse", false));
+
+    for (int s = 0; s < kSlots; ++s)
+    {
+        l.add (std::make_unique<AudioParameterInt> (ParameterID { "smKey" + String (s + 1), 1 }, "Sample Key " + String (s + 1), 0, 127, kDefKeys[s]));
+        l.add (std::make_unique<AudioParameterChoice> (ParameterID { "smMode" + String (s + 1), 1 }, "Sample Mode " + String (s + 1),
+                                                       StringArray { "One-shot", "Gate", "Loop", "Pitched" }, 0));
+        l.add (std::make_unique<AudioParameterFloat> (ParameterID { "smLvl" + String (s + 1), 1 }, "Sample Level " + String (s + 1), 0.f, 1.5f, 1.f));
+    }
+
+    l.add (std::make_unique<AudioParameterChoice> (ParameterID { "seqDir", 1 }, "Seq Direction", StringArray { "Forward", "Backward", "Ping-pong", "Random" }, 0));
+    l.add (std::make_unique<AudioParameterChoice> (ParameterID { "seqRatchet", 1 }, "Seq Ratchet", StringArray { "1x", "2x", "3x", "4x" }, 0));
+    l.add (std::make_unique<AudioParameterBool> (ParameterID { "seqPitch", 1 }, "Step Pitch To Grains", false));
+    for (int s = 0; s < kSteps; ++s)
+        l.add (std::make_unique<AudioParameterInt> (ParameterID { "p" + String (s + 1), 1 }, "Step Pitch " + String (s + 1), -12, 12, 0));
 
     for (int s = 0; s < kSteps; ++s)
     {
@@ -58,14 +75,28 @@ LiveFXProcessor::LiveFXProcessor()
     pSeqOn    = apvts.getRawParameterValue ("seqOn");
     pKeys     = apvts.getRawParameterValue ("keysPitch");
     pLoopRev  = apvts.getRawParameterValue ("loopRev");
+    pSeqDir     = apvts.getRawParameterValue ("seqDir");
+    pSeqRatchet = apvts.getRawParameterValue ("seqRatchet");
+    pSeqPitch   = apvts.getRawParameterValue ("seqPitch");
+    for (int s = 0; s < kSteps; ++s) stepPit[s] = apvts.getRawParameterValue ("p" + String (s + 1));
+    for (auto& a : actionMap) a = -1;
     for (int s = 0; s < kSteps; ++s)
     {
         stepOn[s]  = apvts.getRawParameterValue ("s" + String (s + 1));
         stepLvl[s] = apvts.getRawParameterValue ("l" + String (s + 1));
     }
+    for (int s = 0; s < kSlots; ++s)
+    {
+        pSlotKey[s]  = apvts.getRawParameterValue ("smKey" + String (s + 1));
+        pSlotMode[s] = apvts.getRawParameterValue ("smMode" + String (s + 1));
+        pSlotLvl[s]  = apvts.getRawParameterValue ("smLvl" + String (s + 1));
+    }
     for (auto& p : peaks) p = 0.f;
     formats.registerBasicFormats();
+    startTimerHz (20);   // message-thread jobs: finishing GRAB requests and running sequencer actions
 }
+
+LiveFXProcessor::~LiveFXProcessor() { stopTimer(); }
 
 // Decodes + resamples on the message thread, then hands the result to the audio thread.
 bool LiveFXProcessor::loadAudioFile (const File& f)
@@ -97,6 +128,187 @@ bool LiveFXProcessor::loadAudioFile (const File& f)
     return true;
 }
 
+// ------------------------------- key sampler --------------------------------
+// Samples are kept at their native rate and resampled on playback, so they are always in tune.
+bool LiveFXProcessor::loadSlotFile (int slot, const File& f)
+{
+    if (slot < 0 || slot >= kSlots) return false;
+    std::unique_ptr<AudioFormatReader> reader (formats.createReaderFor (f));
+    if (reader == nullptr || reader->lengthInSamples <= 0) return false;
+
+    const int len = (int) jmin (reader->lengthInSamples, (int64) (30.0 * reader->sampleRate));
+    AudioBuffer<float> b (2, len);
+    b.clear();
+    reader->read (&b, 0, len, 0, true, true);
+    if (reader->numChannels < 2) b.copyFrom (1, 0, b, 0, 0, len);
+    {
+        SpinLock::ScopedLockType lock (slotLock);
+        pendingSlotBuf[slot] = std::move (b);
+        pendingSlotRate[slot] = reader->sampleRate;
+    }
+    slotPending[slot] = true;
+    {
+        ScopedLock l (pathLock);
+        slotPath[slot] = f.getFullPathName();
+        const String n = f.getFileNameWithoutExtension();
+        slotLabel[slot] = n.startsWith ("loop-slot") ? String ("from looper") : n;
+    }
+    return true;
+}
+
+void LiveFXProcessor::clearSlot (int slot)
+{
+    if (slot < 0 || slot >= kSlots) return;
+    {
+        SpinLock::ScopedLockType lock (slotLock);
+        pendingSlotBuf[slot] = AudioBuffer<float>();
+        pendingSlotRate[slot] = 44100.0;
+    }
+    slotPending[slot] = true;
+    { ScopedLock l (pathLock); slotPath[slot] = {}; slotLabel[slot] = {}; }
+}
+
+String LiveFXProcessor::getSlotName (int slot) const
+{
+    ScopedLock l (pathLock);
+    return slotLabel[slot];
+}
+
+// Audio thread: copy the loop (from the loop-start marker to the end, as heard - incl. reverse) into the staging buffer.
+void LiveFXProcessor::captureLoop (int slot)
+{
+    const int st = loopState.load();
+    if (capReady.load() || loopLen <= 0 || st == LEmpty || st == LRec) return;
+    const int len = loopLen - loopStartIdx;
+    if (len < 64 || (size_t) len > capBuf[0].size()) return;
+    const bool rev = pLoopRev->load() > 0.5f;
+    for (int c = 0; c < 2; ++c)
+        for (int k = 0; k < len; ++k)
+            capBuf[c][(size_t) k] = loopBuf[c][(size_t) (rev ? loopLen - 1 - k : loopStartIdx + k)];
+    capLen = len;
+    capSlot = slot;
+    capReady = true;
+}
+
+// Message thread (timer): store the captured loop as a WAV (so it survives saving the project) and hand it to the sampler.
+void LiveFXProcessor::pollCapture()
+{
+    if (! capReady.load()) return;
+    const int slot = capSlot, len = capLen;
+    AudioBuffer<float> b (2, len);
+    for (int c = 0; c < 2; ++c) FloatVectorOperations::copy (b.getWritePointer (c), capBuf[c].data(), len);
+    capReady = false;
+
+    File out = File::getSpecialLocation (File::userApplicationDataDirectory).getChildFile ("LiveFX Performer")
+                   .getChildFile ("captures")
+                   .getChildFile ("loop-slot" + String (slot + 1) + "-" + String (Time::currentTimeMillis()) + ".wav");
+    String path;
+    if (out.getParentDirectory().createDirectory().wasOk())
+    {
+        WavAudioFormat wav;
+        if (auto os = std::unique_ptr<FileOutputStream> (out.createOutputStream()))
+            if (auto w = std::unique_ptr<AudioFormatWriter> (wav.createWriterFor (os.get(), sr, 2, 24, {}, 0)))
+            {
+                os.release();   // the writer owns the stream now
+                w->writeFromAudioSampleBuffer (b, 0, len);
+                path = out.getFullPathName();
+            }
+    }
+    {
+        SpinLock::ScopedLockType lock (slotLock);
+        pendingSlotBuf[slot] = std::move (b);
+        pendingSlotRate[slot] = sr;
+    }
+    slotPending[slot] = true;
+    { ScopedLock l (pathLock); slotPath[slot] = path; slotLabel[slot] = "from looper"; }
+}
+
+void LiveFXProcessor::timerCallback()
+{
+    pollCapture();
+    const unsigned m = pendingActions.exchange (0);
+    for (int a = 0; a < kActions; ++a)
+        if (m & (1u << a)) runSeqAction (a);
+}
+
+// Sequencer pattern actions (message thread). They only edit the step parameters, so everything stays automatable/saved.
+void LiveFXProcessor::runSeqAction (int a)
+{
+    Random r;
+    auto get = [this] (const String& id) { return apvts.getRawParameterValue (id)->load(); };
+    auto set = [this] (const String& id, float plain)
+    {
+        if (auto* p = apvts.getParameter (id)) p->setValueNotifyingHost (p->convertTo0to1 (plain));
+    };
+    const int len = jlimit (1, kSteps, (int) (get ("seqLen") + 0.5f));
+    static const int scale[9] = { -12, -7, -5, 0, 0, 3, 5, 7, 12 };   // note choices for random step pitches
+
+    if (a == 0)          // RANDOMIZE: new random pattern (steps, levels and pitches)
+    {
+        for (int s = 1; s <= kSteps; ++s)
+        {
+            set ("s" + String (s), r.nextFloat() < 0.5f ? 1.f : 0.f);
+            set ("l" + String (s), 0.4f + 0.6f * r.nextFloat());
+            set ("p" + String (s), (float) scale[r.nextInt (9)]);
+        }
+    }
+    else if (a == 1)     // MUTATE: small random changes to the current pattern
+    {
+        for (int k = 0; k < 3; ++k) { const String id = "s" + String (1 + r.nextInt (len)); set (id, get (id) > 0.5f ? 0.f : 1.f); }
+        for (int k = 0; k < 3; ++k) set ("l" + String (1 + r.nextInt (len)), 0.4f + 0.6f * r.nextFloat());
+        for (int k = 0; k < 2; ++k) set ("p" + String (1 + r.nextInt (len)), (float) scale[r.nextInt (9)]);
+    }
+    else if (a == 2 || a == 3)   // SHIFT < / SHIFT >: rotate the pattern by one step
+    {
+        float on[kSteps], lv[kSteps], pt[kSteps];
+        for (int i = 0; i < len; ++i)
+        {
+            on[i] = get ("s" + String (i + 1)); lv[i] = get ("l" + String (i + 1)); pt[i] = get ("p" + String (i + 1));
+        }
+        for (int i = 0; i < len; ++i)
+        {
+            const int src = (a == 2) ? (i + 1) % len : (i + len - 1) % len;
+            set ("s" + String (i + 1), on[src]); set ("l" + String (i + 1), lv[src]); set ("p" + String (i + 1), pt[src]);
+        }
+    }
+    else if (a == 4) { for (int s = 1; s <= kSteps; ++s) set ("s" + String (s), 0.f); }   // CLEAR
+    else if (a == 5) { for (int s = 1; s <= kSteps; ++s) set ("s" + String (s), 1.f); }   // FILL
+}
+
+// A key triggers the slot assigned to it. Keys without a slot play the first "Pitched" slot (if any).
+bool LiveFXProcessor::sampleNoteOn (int note, float vel)
+{
+    int slot = -1;
+    for (int i = 0; i < kSlots && slot < 0; ++i)
+        if (slotLen[i] > 0 && (int) pSlotKey[i]->load() == note) slot = i;
+    for (int i = 0; i < kSlots && slot < 0; ++i)
+        if (slotLen[i] > 0 && (int) pSlotMode[i]->load() == SmPitched) slot = i;
+    if (slot < 0) return false;
+
+    Voice* v = nullptr;
+    for (auto& c : voices) if (! c.active) { v = &c; break; }
+    if (v == nullptr) v = &voices[(size_t) (stealIdx++ % kVoices)];
+
+    const int mode = (int) pSlotMode[slot]->load();
+    const int root = (int) pSlotKey[slot]->load();
+    v->active = true; v->held = true; v->releasing = false;
+    v->slot = slot; v->note = note; v->mode = mode;
+    v->pos = 0.0; v->env = 0.f;
+    v->inc = slotRate[slot] / sr * (mode == SmPitched ? std::pow (2.0, (note - root) / 12.0) : 1.0);
+    v->gain = jmax (0.1f, vel) * pSlotLvl[slot]->load();
+    return true;
+}
+
+void LiveFXProcessor::releaseNote (int note)
+{
+    for (auto& v : voices)
+        if (v.active && v.held && v.note == note)
+        {
+            v.held = false;
+            if (v.mode != SmOneShot) v.releasing = true;   // one-shots always play to the end
+        }
+}
+
 bool LiveFXProcessor::isBusesLayoutSupported (const BusesLayout& l) const
 {
     return l.getMainInputChannelSet() == AudioChannelSet::stereo()
@@ -126,6 +338,11 @@ void LiveFXProcessor::prepareToPlay (double sampleRate, int)
     cutS = 20000.f; dTime = (float) (0.375 * sr); dlpL = dlpR = 0.f;
     gateSm = 1.f; step = 0; accum = 0.0;
     for (auto& p : peaks) p = 0.f;
+    atkStep = 1.f / (0.002f * (float) sr);
+    relStep = 1.f / (0.015f * (float) sr);
+    for (auto& v : voices) v.active = false;
+    for (int c = 0; c < 2; ++c) capBuf[c].assign ((size_t) loopMax, 0.f);
+    capReady = false;
     reverb.setSampleRate (sr);
     reverb.reset();
 }
@@ -155,7 +372,7 @@ void LiveFXProcessor::loopPress()
             loopLen = loopPos; loopPos = 0; loopState = LPlay; computePeaks(); break;
         case LPlay:    loopState = LDub; break;
         case LDub:     loopState = LPlay; computePeaks(); break;
-        case LStopped: loopPos = 0; loopState = LPlay; break;
+        case LStopped: loopPos = loopStartIdx; loopState = LPlay; break;
     }
 }
 
@@ -166,7 +383,7 @@ void LiveFXProcessor::loopStopPlay()
         case LRec:     loopPress(); break;                       // finish recording, start playing
         case LPlay:    loopState = LStopped; break;
         case LDub:     loopState = LStopped; computePeaks(); break;
-        case LStopped: loopPos = 0; loopState = LPlay; break;
+        case LStopped: loopPos = loopStartIdx; loopState = LPlay; break;
         default: break;
     }
 }
@@ -215,12 +432,15 @@ void LiveFXProcessor::padEvent (int idx, bool down)
     }
 }
 
-void LiveFXProcessor::sendPad (int idx, bool down)
+void LiveFXProcessor::pushCmd (int v)
 {
     int s1, n1, s2, n2;
     fifo.prepareToWrite (1, s1, n1, s2, n2);
-    if (n1 > 0) { fifoData[s1] = idx * 2 + (down ? 1 : 0); fifo.finishedWrite (1); }
+    if (n1 > 0) { fifoData[s1] = v; fifo.finishedWrite (1); }
 }
+
+void LiveFXProcessor::sendPad (int idx, bool down) { pushCmd (idx * 2 + (down ? 1 : 0)); }
+void LiveFXProcessor::grabLoopToSlot (int slot)    { if (slot >= 0 && slot < kSlots) pushCmd (1000 + slot); }
 
 void LiveFXProcessor::handleMidi (MidiBuffer& midi)
 {
@@ -233,6 +453,17 @@ void LiveFXProcessor::handleMidi (MidiBuffer& midi)
             float v = (float) m.getControllerValue() / 127.f;
             int li = learnIdx.load();
             if (li >= 0) { ccMap[(size_t) li] = cc; learnIdx = -1; }
+
+            // sequencer action buttons can be mapped to a CC: the action fires when the value rises above half
+            const int al = actionLearn.load();
+            if (al >= 0 && v >= 0.5f) { actionMap[(size_t) al] = cc; actionLearn = -1; ccHigh[cc] = true; }
+            else if (v >= 0.5f && ! ccHigh[cc])
+            {
+                ccHigh[cc] = true;
+                for (int a = 0; a < kActions; ++a)
+                    if (actionMap[(size_t) a].load() == cc) pendingActions.fetch_or (1u << a);
+            }
+            else if (v < 0.5f) ccHigh[cc] = false;
             for (int i = 0; i < NumP; ++i)
                 if (ccMap[(size_t) i].load() == cc)
                     if (auto* p = apvts.getParameter (kParams[i].id)) p->setValueNotifyingHost (v);
@@ -242,14 +473,37 @@ void LiveFXProcessor::handleMidi (MidiBuffer& midi)
             int note = m.getNoteNumber();
             if (m.getChannel() == kPadChannel)
             {
-                if (note >= kPadBaseNote && note < kPadBaseNote + 16) padEvent ((note - kPadBaseNote) & 7, true);
+                if (note >= kPadBaseNote && note < kPadBaseNote + 8) padEvent (note - kPadBaseNote, true);           // pad bank A: looper / FX
+                else if (note >= kPadBaseNote + 8 && note < kPadBaseNote + 16) captureLoop (note - kPadBaseNote - 8);   // pad bank B: GRAB loop into key slot 1-8
             }
-            else keyOffset = jlimit (-24, 24, note - 60);   // keys -> grain pitch (middle C = 0)
+            else if (actionLearn.load() >= 0)   // a key was pressed while learning a sequencer action
+            {
+                actionMap[(size_t) actionLearn.load()] = 128 + note;
+                actionLearn = -1;
+            }
+            else if (actionForNote (note) >= 0)   // this key is mapped to a sequencer action
+                pendingActions.fetch_or (1u << actionForNote (note));
+            else
+            {
+                const int ls = keyLearnSlot.load();
+                if (ls >= 0)   // "KEY" button was pressed in the UI: this key is assigned to that slot
+                {
+                    if (auto* p = apvts.getParameter ("smKey" + String (ls + 1)))
+                        p->setValueNotifyingHost (p->convertTo0to1 ((float) note));
+                    keyLearnSlot = -1;
+                }
+                else if (! sampleNoteOn (note, m.getFloatVelocity()))
+                    keyOffset = jlimit (-24, 24, note - 60);   // keys -> grain pitch (middle C = 0)
+            }
         }
-        else if (m.isNoteOff() && m.getChannel() == kPadChannel)
+        else if (m.isNoteOff())
         {
-            int note = m.getNoteNumber();
-            if (note >= kPadBaseNote && note < kPadBaseNote + 16) padEvent ((note - kPadBaseNote) & 7, false);
+            const int note = m.getNoteNumber();
+            if (m.getChannel() == kPadChannel)
+            {
+                if (note >= kPadBaseNote && note < kPadBaseNote + 8) padEvent (note - kPadBaseNote, false);
+            }
+            else releaseNote (note);
         }
     }
     midi.clear();
@@ -308,6 +562,19 @@ void LiveFXProcessor::processBlock (AudioBuffer<float>& buf, MidiBuffer& midi)
         }
     }
 
+    for (int i = 0; i < kSlots; ++i)   // pick up newly loaded key samples
+    {
+        if (! slotPending[i].load()) continue;
+        SpinLock::ScopedTryLockType lock (slotLock);
+        if (! lock.isLocked()) continue;
+        for (auto& v : voices) if (v.active && v.slot == i) v.active = false;
+        const int newLen = pendingSlotBuf[i].getNumSamples();
+        std::swap (slotBuf[i], pendingSlotBuf[i]);       // swap (not move): nothing is freed on the audio thread
+        std::swap (slotRate[i], pendingSlotRate[i]);
+        slotLen[i] = newLen;
+        slotPending[i] = false;
+    }
+
     handleMidi (midi);
     while (fifo.getNumReady() > 0)
     {
@@ -316,7 +583,8 @@ void LiveFXProcessor::processBlock (AudioBuffer<float>& buf, MidiBuffer& midi)
         if (n1 <= 0) break;
         int v = fifoData[s1];
         fifo.finishedRead (1);
-        padEvent (v >> 1, (v & 1) != 0);
+        if (v >= 1000) captureLoop (v - 1000);
+        else padEvent (v >> 1, (v & 1) != 0);
     }
 
     // ---- fetch parameters ----
@@ -338,12 +606,55 @@ void LiveFXProcessor::processBlock (AudioBuffer<float>& buf, MidiBuffer& midi)
     const float depth = P (SeqDepth);
     const double stepSamples = 60.0 / curBpm * kSeqBeats[jlimit (0, 3, (int) pSeqRate->load())] * sr;
     const bool rev = pLoopRev->load() > 0.5f;
+    {   // loop start point: playback and overdub run from here to the end, then wrap back to here
+        const int minRegion = jmin (loopLen, 1024);
+        loopStartIdx = loopLen > 0 ? jlimit (0, loopLen - minRegion, (int) (P (LoopStart) * (float) loopLen)) : 0;
+    }
     const float outLvl = P (OutLevel);
     const float gateCoef = 1.f - std::exp (-1.f / (0.002f * (float) sr));
-    bool sOn[kSteps]; float sLv[kSteps];
-    for (int s = 0; s < kSteps; ++s) { sOn[s] = stepOn[s]->load() > 0.5f; sLv[s] = stepLvl[s]->load(); }
+    bool sOn[kSteps]; float sLv[kSteps]; int sPit[kSteps];
+    for (int s = 0; s < kSteps; ++s) { sOn[s] = stepOn[s]->load() > 0.5f; sLv[s] = stepLvl[s]->load(); sPit[s] = (int) stepPit[s]->load(); }
 
-    if (seqOn && ! lastSeqOn) { step = 0; accum = 0.0; }
+    // sequencer settings
+    const int seqLen = jlimit (1, kSteps, (int) (P (SeqLen) + 0.5f));
+    const int seqDirV = jlimit (0, 3, (int) pSeqDir->load());
+    const int ratchet = 1 + jlimit (0, 3, (int) pSeqRatchet->load());
+    const float swing = P (SeqSwing), gateLen = P (SeqGate), prob = P (SeqProb);
+    const bool seqPitchOn = pSeqPitch->load() > 0.5f;
+    if (step >= seqLen) step = 0;
+    if (! seqOn) seqPitchSt = 0.f;
+
+    // decide what the current step does (probability, level, pitch) and how long it lasts (swing)
+    auto beginStep = [&]
+    {
+        stepActive = sOn[step] && (prob >= 0.999f || rng.nextFloat() < prob);
+        stepLevel = sLv[step];
+        seqPitchSt = seqPitchOn ? (float) sPit[step] : 0.f;
+        curLen = jmax (16.0, stepSamples * (((tickCount & 1) == 0) ? 1.0 + 0.5 * swing : 1.0 - 0.5 * swing));
+    };
+    // move to the next step according to the direction setting
+    auto nextStep = [&]
+    {
+        switch (seqDirV)
+        {
+            case 0:  step = (step + 1) % seqLen; break;
+            case 1:  step = (step + seqLen - 1) % seqLen; break;
+            case 2:
+                if (seqLen < 2) { step = 0; break; }
+                step += pingDir;
+                if (step >= seqLen) { pingDir = -1; step = seqLen - 2; }
+                else if (step < 0)  { pingDir = 1;  step = 1; }
+                break;
+            default: step = rng.nextInt (seqLen); break;
+        }
+    };
+
+    if (seqOn && ! lastSeqOn)
+    {
+        step = (seqDirV == 1) ? seqLen - 1 : 0;
+        tickCount = 0; pingDir = 1; accum = 0.0;
+        beginStep();
+    }
     lastSeqOn = seqOn;
 
     const float grainGain = 1.f / std::sqrt (jmax (1.f, grDens * grSizeMs * 0.001f));
@@ -356,7 +667,32 @@ void LiveFXProcessor::processBlock (AudioBuffer<float>& buf, MidiBuffer& midi)
 
     for (int i = 0; i < n; ++i)
     {
-        const float inL = L[i], inR = R[i];
+        // ---- key sampler voices (mixed in before the looper, so the loop can record them) ----
+        float sL = 0.f, sR = 0.f;
+        for (auto& v : voices)
+        {
+            if (! v.active) continue;
+            const int len = slotLen[v.slot];
+            if (len < 2) { v.active = false; continue; }
+            int i0 = (int) v.pos;
+            if (i0 >= len)
+            {
+                if (v.mode == SmLoop) { v.pos -= (double) len; i0 = (int) v.pos; }
+                else { v.active = false; continue; }
+            }
+            int i1 = i0 + 1;
+            if (i1 >= len) i1 = (v.mode == SmLoop) ? 0 : len - 1;
+            const float* dl = slotBuf[v.slot].getReadPointer (0);
+            const float* dr = slotBuf[v.slot].getReadPointer (1);
+            const float fr = (float) (v.pos - i0);
+            if (v.releasing) { v.env -= relStep; if (v.env <= 0.f) { v.active = false; continue; } }
+            else if (v.env < 1.f) v.env = jmin (1.f, v.env + atkStep);
+            sL += (dl[i0] + (dl[i1] - dl[i0]) * fr) * v.env * v.gain;
+            sR += (dr[i0] + (dr[i1] - dr[i0]) * fr) * v.env * v.gain;
+            v.pos += v.inc;
+        }
+
+        const float inL = L[i] + sL, inR = R[i] + sR;
 
         // ---- looper (records dry input, plays back into the FX chain) ----
         float lpL = 0.f, lpR = 0.f;
@@ -369,14 +705,15 @@ void LiveFXProcessor::processBlock (AudioBuffer<float>& buf, MidiBuffer& midi)
         }
         else if ((st == LPlay || st == LDub) && loopLen > 0)
         {
-            const size_t idx = (size_t) (rev ? loopLen - 1 - loopPos : loopPos);
+            if (loopPos < loopStartIdx || loopPos >= loopLen) loopPos = loopStartIdx;
+            const size_t idx = (size_t) (rev ? loopLen - 1 + loopStartIdx - loopPos : loopPos);
             lpL = loopBuf[0][idx]; lpR = loopBuf[1][idx];
             if (st == LDub)
             {
                 loopBuf[0][idx] = std::tanh (lpL + inL);
                 loopBuf[1][idx] = std::tanh (lpR + inR);
             }
-            if (++loopPos >= loopLen) loopPos = 0;
+            if (++loopPos >= loopLen) loopPos = loopStartIdx;
         }
         float xL = inL + lpL * loopLvl, xR = inR + lpR * loopLvl;
 
@@ -397,8 +734,10 @@ void LiveFXProcessor::processBlock (AudioBuffer<float>& buf, MidiBuffer& midi)
         if (seqOn)
         {
             accum += 1.0;
-            if (accum >= stepSamples) { accum -= stepSamples; step = (step + 1) % kSteps; }
-            const float t = sOn[step] ? sLv[step] : 0.f;
+            if (accum >= curLen) { accum -= curLen; ++tickCount; nextStep(); beginStep(); }
+            const double sub = accum / curLen * ratchet;                 // ratchet: repeat the gate inside the step
+            const bool open = stepActive && (sub - std::floor (sub)) < (double) gateLen;
+            const float t = open ? stepLevel : 0.f;
             gTarget = 1.f - depth * (1.f - t);
         }
         gateSm += (gTarget - gateSm) * gateCoef;
@@ -456,7 +795,7 @@ void LiveFXProcessor::processBlock (AudioBuffer<float>& buf, MidiBuffer& midi)
             grainCountdown -= 1.f;
             if (grainCountdown <= 0.f)
             {
-                spawnGrain (grSizeMs, pitch, grPos, grSpray);
+                spawnGrain (grSizeMs, pitch + seqPitchSt, grPos, grSpray);   // + pitch of the current sequencer step (if enabled)
                 grainCountdown = (float) sr / grDens * (0.7f + 0.6f * rng.nextFloat());
             }
             float gl = 0.f, gr = 0.f;
@@ -530,6 +869,8 @@ void LiveFXProcessor::getStateInformation (MemoryBlock& dest)
     StringArray sa;
     for (auto& c : ccMap) sa.add (String (c.load()));
     state.setProperty ("ccMap", sa.joinIntoString (","), nullptr);
+    { ScopedLock l (pathLock); for (int s = 0; s < kSlots; ++s) state.setProperty ("slotPath" + String (s), slotPath[s], nullptr); }
+    { StringArray act; for (auto& a : actionMap) act.add (String (a.load())); state.setProperty ("actionMap", act.joinIntoString (","), nullptr); }
     if (auto xml = state.createXml()) copyXmlToBinary (*xml, dest);
 }
 
@@ -541,7 +882,14 @@ void LiveFXProcessor::setStateInformation (const void* data, int size)
         if (! vt.isValid()) return;
         auto sa = StringArray::fromTokens (vt.getProperty ("ccMap").toString(), ",", "");
         for (int i = 0; i < NumP && i < sa.size(); ++i) ccMap[(size_t) i] = sa[i].getIntValue();
+        auto act = StringArray::fromTokens (vt.getProperty ("actionMap").toString(), ",", "");
+        for (int i = 0; i < kActions && i < act.size(); ++i) actionMap[(size_t) i] = act[i].getIntValue();
         apvts.replaceState (vt);
+        for (int s = 0; s < kSlots; ++s)   // reload the sounds assigned to keys
+        {
+            const String path = vt.getProperty ("slotPath" + String (s)).toString();
+            if (path.isNotEmpty() && File (path).existsAsFile()) loadSlotFile (s, File (path));
+        }
     }
 }
 
