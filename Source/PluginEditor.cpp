@@ -65,8 +65,6 @@ void LearnKnob::mouseDown (const MouseEvent& e)
 // ------------------------------- Editor ------------------------------------
 LiveFXEditor::LiveFXEditor (LiveFXProcessor& p) : AudioProcessorEditor (&p), proc (p)
 {
-    setSize (1100, 720);
-
     auto knob = [&] (int idx, const char* label)
     {
         auto k = std::make_unique<LearnKnob> (proc, idx, label);
@@ -163,6 +161,7 @@ LiveFXEditor::LiveFXEditor (LiveFXProcessor& p) : AudioProcessorEditor (&p), pro
         stepSld[s] = sl.get(); sliders.push_back (std::move (sl));
     }
 
+    setSize (1100, 720);   // must come after all controls exist: it triggers resized()
     startTimerHz (30);
 }
 
