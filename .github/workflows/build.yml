@@ -10,9 +10,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Use Xcode 16.4
+      - name: Select Xcode
         run: |
-          sudo xcode-select -s /Applications/Xcode_16.4.app
+          echo "Installed Xcode versions:"
+          ls -d /Applications/Xcode*.app || true
+          XC=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$XC" ]; then XC=$(ls -d /Applications/Xcode_15*.app 2>/dev/null | sort -V | tail -1); fi
+          if [ -n "$XC" ]; then
+            echo "Using $XC"
+            sudo xcode-select -s "$XC"
+          else
+            echo "No Xcode 15/16 found, using the default"
+          fi
           clang --version
 
       - name: Configure
