@@ -151,7 +151,22 @@ LiveFXEditor::LiveFXEditor (LiveFXProcessor& p) : AudioProcessorEditor (&p), pro
     // sequencer
     seqOnBtn = toggle ("SEQUENCER ON   (pad 7)", "seqOn");
     seqRateCb = combo ({ "1/4", "1/8", "1/16", "1/32" }, "seqRate");
+    knob (SeqLen, "Length"); knob (SeqSwing, "Swing"); knob (SeqGate, "Gate Len"); knob (SeqProb, "Probability");
     knob (SeqDepth, "Gate Depth"); knob (OutLevel, "OUTPUT");
+    seqDirCb = combo ({ "Forward", "Backward", "Ping-pong", "Random" }, "seqDir");
+    seqRatchetCb = combo ({ "Ratchet 1x", "Ratchet 2x", "Ratchet 3x", "Ratchet 4x" }, "seqRatchet");
+    for (int a = 0; a < kActions; ++a)   // right-click = MIDI learn (a key or a CC on the MiniLab)
+    {
+        seqActBtn[a] = action (kActionNames[a]);
+        seqActBtn[a]->setTriggeredOnMouseDown (true);
+        seqActBtn[a]->addMouseListener (this, false);
+        seqActBtn[a]->onClick = [this, a] { if (! ModifierKeys::getCurrentModifiers().isPopupMenu()) proc.runSeqAction (a); };
+    }
+    editModeBtn = action ("EDIT: LEVEL");
+    editModeBtn->setClickingTogglesState (true);
+    editModeBtn->setColour (TextButton::buttonOnColourId, kOrange);
+    editModeBtn->onClick = [this] { updateEditMode(); };
+    seqPitchBtn = toggle ("STEP PITCH > GRAINS", "seqPitch");
     for (int s = 0; s < kSteps; ++s)
     {
         stepBtn[s] = toggle (String (s + 1), "s" + String (s + 1));
@@ -160,6 +175,13 @@ LiveFXEditor::LiveFXEditor (LiveFXProcessor& p) : AudioProcessorEditor (&p), pro
         addAndMakeVisible (*sl);
         sAtt.push_back (std::make_unique<AudioProcessorValueTreeState::SliderAttachment> (proc.apvts, "l" + String (s + 1), *sl));
         stepSld[s] = sl.get(); sliders.push_back (std::move (sl));
+
+        auto ps = std::make_unique<Slider> (Slider::LinearVertical, Slider::TextBoxBelow);
+        ps->setTextBoxStyle (Slider::TextBoxBelow, false, 40, 14);
+        ps->setColour (Slider::trackColourId, kOrange);
+        addChildComponent (*ps);   // shown instead of the level slider in "EDIT: PITCH" mode
+        sAtt.push_back (std::make_unique<AudioProcessorValueTreeState::SliderAttachment> (proc.apvts, "p" + String (s + 1), *ps));
+        stepPit[s] = ps.get(); sliders.push_back (std::move (ps));
     }
 
     // key sampler
@@ -193,7 +215,8 @@ LiveFXEditor::LiveFXEditor (LiveFXProcessor& p) : AudioProcessorEditor (&p), pro
         slotLvl[(size_t) s] = sl.get(); sliders.push_back (std::move (sl));
     }
 
-    setSize (1100, 860);   // must come after all controls exist: it triggers resized()
+    updateEditMode();
+    setSize (1100, 880);   // must come after all controls exist: it triggers resized()
     startTimerHz (30);
 }
 
@@ -240,7 +263,48 @@ void LiveFXEditor::timerCallback()
                                             : "KEY: " + MidiMessage::getMidiNoteName (key, true, true, 3));
         slotKey[i]->setColour (TextButton::buttonColourId, learning ? kOrange : getLookAndFeel().findColour (TextButton::buttonColourId));
     }
+    for (int a = 0; a < kActions; ++a)
+    {
+        String t = kActionNames[a];
+        const int code = proc.actionMap[(size_t) a].load();
+        if (proc.actionLearn.load() == a) t += "  [press...]";
+        else if (code >= 0) t += "  [" + (code < 128 ? "CC" + String (code) : MidiMessage::getMidiNoteName (code - 128, true, true, 3)) + "]";
+        seqActBtn[a]->setButtonText (t);
+    }
+    const int seqLenV = jlimit (1, kSteps, (int) (proc.apvts.getRawParameterValue ("seqLen")->load() + 0.5f));
+    for (int s = 0; s < kSteps; ++s)   // steps beyond the pattern length are greyed out
+    {
+        const bool en = s < seqLenV;
+        if (stepBtn[s]->isEnabled() != en) { stepBtn[s]->setEnabled (en); stepSld[s]->setEnabled (en); stepPit[s]->setEnabled (en); }
+    }
     repaint();
+}
+
+void LiveFXEditor::updateEditMode()
+{
+    const bool pitch = editModeBtn->getToggleState();
+    for (int s = 0; s < kSteps; ++s) { stepSld[s]->setVisible (! pitch); stepPit[s]->setVisible (pitch); }
+    editModeBtn->setButtonText (pitch ? "EDIT: PITCH" : "EDIT: LEVEL");
+}
+
+void LiveFXEditor::mouseDown (const MouseEvent& e)
+{
+    if (! e.mods.isPopupMenu()) return;
+    for (int a = 0; a < kActions; ++a)
+        if (e.eventComponent == seqActBtn[a])
+        {
+            PopupMenu m;
+            m.addItem (1, "MIDI learn (then press a key or move a control on the MiniLab)");
+            m.addItem (2, "Clear MIDI mapping");
+            Component::SafePointer<LiveFXEditor> safe (this);
+            m.showMenuAsync (PopupMenu::Options(), [safe, a] (int r)
+            {
+                if (safe == nullptr) return;
+                if (r == 1) safe->proc.actionLearn = a;
+                if (r == 2) safe->proc.actionMap[(size_t) a] = -1;
+            });
+            return;
+        }
 }
 
 static void row (Rectangle<int> r, std::initializer_list<Component*> cs)
@@ -297,17 +361,25 @@ void LiveFXEditor::resized()
     {
         auto c = content (seqR);
         auto top = c.removeFromTop (90);
-        auto left = top.removeFromLeft (260);
-        seqOnBtn->setBounds (left.removeFromTop (38).reduced (2));
-        seqRateCb->setBounds (left.removeFromTop (38).reduced (2));
-        knobs[SeqDepth]->setBounds (top.removeFromLeft (110));
-        knobs[OutLevel]->setBounds (top.removeFromRight (110));
+        auto colA = top.removeFromLeft (200);
+        seqOnBtn->setBounds (colA.removeFromTop (40).reduced (2));
+        seqRateCb->setBounds (colA.removeFromTop (40).reduced (2));
+        auto colB = top.removeFromLeft (170);
+        seqDirCb->setBounds (colB.removeFromTop (40).reduced (2));
+        seqRatchetCb->setBounds (colB.removeFromTop (40).reduced (2));
+        knobs[OutLevel]->setBounds (top.removeFromRight (100));
+        row (top, { knobs[SeqLen], knobs[SeqSwing], knobs[SeqGate], knobs[SeqProb], knobs[SeqDepth] });
+        c.removeFromTop (2);
+        row (c.removeFromTop (28), { seqActBtn[0], seqActBtn[1], seqActBtn[2], seqActBtn[3], seqActBtn[4], seqActBtn[5], editModeBtn, seqPitchBtn });
+        c.removeFromTop (4);
         const int w = c.getWidth() / kSteps;
         for (int s = 0; s < kSteps; ++s)
         {
             auto col = c.removeFromLeft (w).reduced (2);
             stepBtn[s]->setBounds (col.removeFromTop (28));
-            stepSld[s]->setBounds (col.reduced (0, 4));
+            const auto sb = col.reduced (0, 3);
+            stepSld[s]->setBounds (sb);
+            stepPit[s]->setBounds (sb);
         }
     }
     // key sampler
@@ -320,13 +392,13 @@ void LiveFXEditor::resized()
             auto top = col.removeFromTop (30);
             slotClear[s]->setBounds (top.removeFromRight (28));
             slotLoad[s]->setBounds (top.withTrimmedRight (2));
-            col.removeFromTop (4);
+            col.removeFromTop (3);
             auto r2 = col.removeFromTop (28);
             slotGrab[s]->setBounds (r2.removeFromRight (50));
             slotKey[s]->setBounds (r2.withTrimmedRight (2));
-            col.removeFromTop (4);
+            col.removeFromTop (3);
             slotMode[s]->setBounds (col.removeFromTop (28));
-            col.removeFromTop (4);
+            col.removeFromTop (3);
             slotLvl[s]->setBounds (col.removeFromTop (26));
         }
     }
@@ -348,7 +420,7 @@ void LiveFXEditor::paint (Graphics& g)
     panel (delayR,  "PING-PONG DELAY");
     panel (reverbR, "REVERB");
     panel (fxR,     "FILTER / CRUSH / DRIVE / STUTTER");
-    panel (seqR,    "STEP GATE SEQUENCER  (16 steps - toggle = on, slider = level)");
+    panel (seqR,    "STEP SEQUENCER  -  right-click an action button to MIDI-learn it (press a key or a control on the MiniLab)");
     panel (sampR,   "KEY SAMPLER  -  LOAD a file or GRAB the loop (UI button or pad bank B, pads 1-8) into a slot, click KEY, press a key");
 
     // ---- looper window ----
