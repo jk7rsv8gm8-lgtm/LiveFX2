@@ -30,10 +30,13 @@ public:
 
     bool isInterestedInFileDrag (const juce::StringArray&) override { return true; }
     void filesDropped (const juce::StringArray& files, int, int) override;
+    void mouseDown (const juce::MouseEvent&) override;   // right-click a sequencer action = MIDI learn
 
 private:
     void timerCallback() override;
     void loadFile (const juce::File&);
+    void loadSlot (int slot, const juce::File&);
+    void updateEditMode();
     std::unique_ptr<juce::FileChooser> chooser;
     juce::TextButton* loadBtn {};
 
@@ -53,11 +56,19 @@ private:
     juce::ComboBox *dlDivCb {}, *fltTypeCb {}, *stutDivCb {}, *seqRateCb {};
     juce::TextButton* stepBtn[kSteps] {};
     juce::Slider* stepSld[kSteps] {};
+    juce::Slider* stepPit[kSteps] {};
+    juce::TextButton* seqActBtn[kActions] {};
+    juce::TextButton *editModeBtn {}, *seqPitchBtn {};
+    juce::ComboBox *seqDirCb {}, *seqRatchetCb {};
     bool stutterDown = false;
+    std::array<juce::TextButton*, kSlots> slotLoad {}, slotKey {}, slotClear {}, slotGrab {};
+    std::array<juce::ComboBox*, kSlots> slotMode {};
+    std::array<juce::Slider*, kSlots> slotLvl {};
 
     juce::Rectangle<int> looperR { 10, 10, 520, 250 }, granR { 540, 10, 550, 250 },
-                         delayR { 10, 270, 360, 190 }, reverbR { 380, 270, 270, 190 },
-                         fxR { 660, 270, 430, 190 }, seqR { 10, 470, 1080, 240 }, waveR;
+                         delayR { 10, 270, 360, 170 }, reverbR { 380, 270, 270, 170 },
+                         fxR { 660, 270, 430, 170 }, seqR { 10, 450, 1080, 250 },
+                         sampR { 10, 710, 1080, 160 }, waveR;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (LiveFXEditor)
 };
