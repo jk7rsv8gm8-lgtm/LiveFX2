@@ -6,28 +6,23 @@ on:
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            name: macOS
-            extra: -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
-          - os: windows-latest
-            name: Windows
-            extra: ""
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCOPY_AFTER_BUILD=OFF ${{ matrix.extra }}
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCOPY_AFTER_BUILD=OFF -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
 
       - name: Build
         run: cmake --build build --config Release --parallel
 
-      - name: Upload VST3
+      - name: Sign and package
+        run: |
+          codesign --force --deep -s - "build/LiveFX_artefacts/Release/VST3/LiveFX Performer.vst3"
+          ditto -c -k --sequesterRsrc --keepParent "build/LiveFX_artefacts/Release/VST3/LiveFX Performer.vst3" LiveFX-Performer-macOS.zip
+
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: LiveFX-VST3-${{ matrix.name }}
-          path: build/LiveFX_artefacts/Release/VST3
+          name: LiveFX-VST3-macOS
+          path: LiveFX-Performer-macOS.zip
