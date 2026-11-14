@@ -5,20 +5,25 @@
 //  Performance settings - edit these to match your MiniLab 3 setup
 // ---------------------------------------------------------------------------
 constexpr int kPadChannel  = 10;   // MiniLab 3 pads send on MIDI channel 10 by default
-constexpr int kPadBaseNote = 36;   // pads: notes 36-43 (bank A) and 44-51 (bank B) -> pads 1-8
+constexpr int kPadBaseNote = 36;   // pad bank A: notes 36-43 = looper/FX actions; pad bank B: notes 44-51 = GRAB loop into key slot 1-8
 constexpr int kSteps       = 16;
 constexpr int kPeaks       = 256;
+constexpr int kSlots       = 8;    // key-sampler slots
+constexpr int kVoices      = 16;   // key-sampler polyphony
+constexpr int kActions     = 6;    // sequencer one-shot actions (randomize, mutate, shift, clear, fill)
+inline constexpr const char* kActionNames[kActions] = { "RANDOMIZE", "MUTATE", "SHIFT <", "SHIFT >", "CLEAR", "FILL" };
 
 // Continuous parameters. 'cc' = default MIDI CC (-1 = none). Every one of them can be re-mapped
 // with MIDI learn (right-click a knob in the plugin window).
 struct PDef { const char* id; const char* name; float lo, hi, def, mid; int cc; };
 
-enum PIdx { LoopLevel, GrMix, GrSize, GrPitch, GrDens, GrPos, GrSpray,
+enum PIdx { LoopLevel, LoopStart, GrMix, GrSize, GrPitch, GrDens, GrPos, GrSpray,
             DlMix, DlTime, DlFb, DlTone, RvMix, RvSize, RvDamp,
-            FltCut, FltRes, Crush, Drive, SeqDepth, OutLevel, NumP };
+            FltCut, FltRes, Crush, Drive, SeqDepth, SeqLen, SeqSwing, SeqGate, SeqProb, OutLevel, NumP };
 
 inline constexpr PDef kParams[NumP] = {
     { "loopLevel", "Loop Level",     0.f,   1.f,    0.8f,   -1.f,   -1 },
+    { "loopStart", "Loop Start",     0.f,   1.f,    0.f,    -1.f,   -1 },
     { "grMix",     "Grain Mix",      0.f,   1.f,    0.f,    -1.f,   74 },
     { "grSize",    "Grain Size",     10.f,  500.f,  120.f,  100.f,  71 },
     { "grPitch",   "Grain Pitch",    -24.f, 24.f,   0.f,    -1.f,   76 },
@@ -37,15 +42,20 @@ inline constexpr PDef kParams[NumP] = {
     { "crush",     "Crusher",        0.f,   1.f,    0.f,    -1.f,   16 },
     { "drive",     "Drive",          0.f,   1.f,    0.f,    -1.f,   -1 },
     { "seqDepth",  "Seq Depth",      0.f,   1.f,    1.f,    -1.f,   -1 },
+    { "seqLen",    "Seq Length",     1.f,   16.f,   16.f,   -1.f,   -1 },
+    { "seqSwing",  "Swing",          0.f,   1.f,    0.f,    -1.f,   -1 },
+    { "seqGate",   "Gate Length",    0.05f, 1.f,    1.f,    -1.f,   -1 },
+    { "seqProb",   "Probability",    0.f,   1.f,    1.f,    -1.f,   -1 },
     { "outLevel",  "Output",         0.f,   1.5f,   1.f,    -1.f,   -1 },
 };
 
 enum LoopState { LEmpty, LRec, LPlay, LDub, LStopped };
 
-class LiveFXProcessor : public juce::AudioProcessor
+class LiveFXProcessor : public juce::AudioProcessor, private juce::Timer
 {
 public:
     LiveFXProcessor();
+    ~LiveFXProcessor() override;
 
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
     void releaseResources() override {}
@@ -80,11 +90,43 @@ public:
     // Message thread only. Returns false if the file could not be read.
     bool loadAudioFile (const juce::File&);
 
+    // ---- key sampler: assign sounds to keys ----
+    bool loadSlotFile (int slot, const juce::File&);     // message thread
+    void clearSlot (int slot);                           // message thread
+    juce::String getSlotName (int slot) const;
+    int getSlotKey (int slot) const { return (int) pSlotKey[slot]->load(); }
+    std::atomic<int> keyLearnSlot { -1 };                // slot waiting for a key press
+    void grabLoopToSlot (int slot);                      // copy the current loop into a key slot (from the UI)
+
+    // ---- sequencer actions (randomize, mutate, shift, clear, fill) ----
+    void runSeqAction (int action);                      // message thread
+    std::array<std::atomic<int>, kActions> actionMap;    // -1 none, 0..127 = CC number, 128+n = key n
+    std::atomic<int> actionLearn { -1 };
+
 private:
     juce::AudioFormatManager formats;
     juce::SpinLock pendingLock;
     juce::AudioBuffer<float> pendingBuf;
     std::atomic<bool> hasPending { false };
+
+    // key sampler data. slotBuf/slotRate/slotLen belong to the audio thread; new samples arrive via pending*.
+    std::atomic<float> *pSlotKey[kSlots] {}, *pSlotMode[kSlots] {}, *pSlotLvl[kSlots] {};
+    juce::AudioBuffer<float> slotBuf[kSlots], pendingSlotBuf[kSlots];
+    double slotRate[kSlots] {}, pendingSlotRate[kSlots] {};
+    int slotLen[kSlots] {};
+    std::atomic<bool> slotPending[kSlots] {};
+    juce::SpinLock slotLock;
+    struct Voice { bool active = false, held = false, releasing = false; int slot = 0, note = 0, mode = 0;
+                   double pos = 0.0, inc = 1.0; float env = 0.f, gain = 1.f; };
+    std::array<Voice, kVoices> voices;
+    int stealIdx = 0;
+    float atkStep = 0.01f, relStep = 0.002f;
+    juce::String slotPath[kSlots];
+    juce::String slotLabel[kSlots];
+    mutable juce::CriticalSection pathLock;
+    std::vector<float> capBuf[2];
+    int capLen = 0, capSlot = 0;
+    std::atomic<bool> capReady { false };
 
     void handleMidi (juce::MidiBuffer&);
     void padEvent (int idx, bool down);
@@ -95,13 +137,23 @@ private:
     void computePeaks();
     void startStutter();
     void spawnGrain (float sizeMs, float pitch, float posKnob, float spray);
+    bool sampleNoteOn (int note, float vel);
+    void releaseNote (int note);
+    void pushCmd (int v);
+    void captureLoop (int slot);      // audio thread: copy the loop into the staging buffer
+    void pollCapture();               // message thread: turn the staging buffer into a key sound
+    void timerCallback() override;
+    int actionForNote (int note) const { for (int a = 0; a < kActions; ++a) if (actionMap[(size_t) a].load() == 128 + note) return a; return -1; }
 
     double sr = 44100.0, curBpm = 120.0;
 
     std::atomic<float>* pv[NumP] {};
     std::atomic<float> *pFltType {}, *pDlDiv {}, *pSeqRate {}, *pStutDiv {}, *pDlSync {},
                        *pGrFreeze {}, *pRvFreeze {}, *pSeqOn {}, *pKeys {}, *pLoopRev {};
-    std::atomic<float> *stepOn[kSteps] {}, *stepLvl[kSteps] {};
+    std::atomic<float> *stepOn[kSteps] {}, *stepLvl[kSteps] {}, *stepPit[kSteps] {};
+    std::atomic<float> *pSeqDir {}, *pSeqRatchet {}, *pSeqPitch {};
+    std::atomic<unsigned> pendingActions { 0 };
+    bool ccHigh[128] {};
     std::atomic<int> keyOffset { 0 };
 
     juce::AbstractFifo fifo { 64 };
@@ -109,7 +161,7 @@ private:
 
     // looper
     std::vector<float> loopBuf[2];
-    int loopMax = 0, loopLen = 0, loopPos = 0;
+    int loopMax = 0, loopLen = 0, loopPos = 0, loopStartIdx = 0;
 
     // history for stutter
     std::vector<float> hBuf[2];
@@ -136,10 +188,10 @@ private:
     float heldL = 0.f, heldR = 0.f;
 
     // sequencer
-    int step = 0;
-    double accum = 0.0;
-    bool lastSeqOn = false;
-    float gateSm = 1.f;
+    int step = 0, tickCount = 0, pingDir = 1;
+    double accum = 0.0, curLen = 1000.0;
+    bool lastSeqOn = false, stepActive = true;
+    float gateSm = 1.f, stepLevel = 1.f, seqPitchSt = 0.f;
 
     juce::Reverb reverb;
 
