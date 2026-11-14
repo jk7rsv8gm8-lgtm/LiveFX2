@@ -18,11 +18,11 @@ jobs:
 
       - name: Sign and package
         run: |
-          codesign --force --deep -s - "build/LiveFX_artefacts/Release/VST3/LiveFX Performer.vst3"
-          ditto -c -k --sequesterRsrc --keepParent "build/LiveFX_artefacts/Release/VST3/LiveFX Performer.vst3" LiveFX-Performer-macOS.zip
+          codesign --force --deep -s - "build/LiveFX_artefacts/Release/VST3/LiveFX Performer 2.vst3"
+          ditto -c -k --sequesterRsrc --keepParent "build/LiveFX_artefacts/Release/VST3/LiveFX Performer 2.vst3" LiveFX-Performer-2-macOS.zip
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: LiveFX-VST3-macOS
-          path: LiveFX-Performer-macOS.zip
+          path: LiveFX-Performer-2-macOS.zip
