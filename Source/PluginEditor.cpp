@@ -98,11 +98,11 @@ LiveFXEditor::LiveFXEditor (LiveFXProcessor& p) : AudioProcessorEditor (&p), pro
     };
 
     // looper
-    recBtn  = action ("REC / PLAY / DUB   (pad 1)");
-    stopBtn = action ("STOP / PLAY   (pad 2)");
-    clearBtn = action ("CLEAR   (pad 3)");
-    revBtn  = toggle ("REVERSE   (pad 4)", "loopRev");
-    loadBtn = action ("LOAD AUDIO FILE...");
+    recBtn  = action ("REC/PLAY/DUB (pad 1)");
+    stopBtn = action ("STOP/PLAY (pad 2)");
+    clearBtn = action ("CLEAR (3)");
+    revBtn  = toggle ("REVERSE (4)", "loopRev");
+    loadBtn = action ("LOAD FILE...");
     loadBtn->onClick = [this]
     {
         chooser = std::make_unique<FileChooser> ("Load an audio file into the looper", File(),
@@ -119,6 +119,7 @@ LiveFXEditor::LiveFXEditor (LiveFXProcessor& p) : AudioProcessorEditor (&p), pro
     stopBtn->onClick  = [this] { proc.sendPad (1, true); };
     clearBtn->onClick = [this] { proc.sendPad (2, true); };
     knob (LoopLevel, "Loop Level");
+    knob (LoopStart, "Loop Start");
 
     // granular
     for (auto [i, l] : { std::pair<int, const char*> { GrMix, "Grain Mix" }, { GrSize, "Size ms" }, { GrPitch, "Pitch st" },
@@ -161,7 +162,38 @@ LiveFXEditor::LiveFXEditor (LiveFXProcessor& p) : AudioProcessorEditor (&p), pro
         stepSld[s] = sl.get(); sliders.push_back (std::move (sl));
     }
 
-    setSize (1100, 720);   // must come after all controls exist: it triggers resized()
+    // key sampler
+    for (int s = 0; s < kSlots; ++s)
+    {
+        slotLoad[(size_t) s] = action ("load sound...");
+        slotLoad[(size_t) s]->onClick = [this, s]
+        {
+            chooser = std::make_unique<FileChooser> ("Choose a sound for slot " + String (s + 1), File(),
+                                                     "*.wav;*.aif;*.aiff;*.flac;*.ogg;*.mp3");
+            Component::SafePointer<LiveFXEditor> safe (this);
+            chooser->launchAsync (FileBrowserComponent::openMode | FileBrowserComponent::canSelectFiles,
+                                  [safe, s] (const FileChooser& fc)
+                                  {
+                                      auto f = fc.getResult();
+                                      if (safe != nullptr && f != File()) safe->loadSlot (s, f);
+                                  });
+        };
+        slotClear[(size_t) s] = action ("X");
+        slotClear[(size_t) s]->onClick = [this, s] { proc.clearSlot (s); };
+        slotKey[(size_t) s] = action ("KEY");
+        slotKey[(size_t) s]->onClick = [this, s] { proc.keyLearnSlot = (proc.keyLearnSlot.load() == s) ? -1 : s; };
+        slotGrab[(size_t) s] = action ("GRAB");
+        slotGrab[(size_t) s]->onClick = [this, s] { proc.grabLoopToSlot (s); };
+        slotMode[(size_t) s] = combo ({ "One-shot", "Gate", "Loop", "Pitched" }, "smMode" + String (s + 1));
+
+        auto sl = std::make_unique<Slider> (Slider::LinearHorizontal, Slider::NoTextBox);
+        sl->setColour (Slider::trackColourId, kAccent);
+        addAndMakeVisible (*sl);
+        sAtt.push_back (std::make_unique<AudioProcessorValueTreeState::SliderAttachment> (proc.apvts, "smLvl" + String (s + 1), *sl));
+        slotLvl[(size_t) s] = sl.get(); sliders.push_back (std::move (sl));
+    }
+
+    setSize (1100, 860);   // must come after all controls exist: it triggers resized()
     startTimerHz (30);
 }
 
@@ -174,14 +206,40 @@ void LiveFXEditor::loadFile (const File& f)
                                           "This file could not be read (supported: WAV, AIFF, FLAC, OGG, MP3).");
 }
 
-void LiveFXEditor::filesDropped (const StringArray& files, int, int)
+void LiveFXEditor::loadSlot (int slot, const File& f)
 {
-    if (files.size() > 0) loadFile (File (files[0]));
+    if (! proc.loadSlotFile (slot, f))
+        AlertWindow::showMessageBoxAsync (MessageBoxIconType::WarningIcon, "Could not load file",
+                                          "This file could not be read (supported: WAV, AIFF, FLAC, OGG, MP3).");
+}
+
+// Files dropped on the sampler panel fill slots (starting at the column under the mouse); elsewhere they go to the looper.
+void LiveFXEditor::filesDropped (const StringArray& files, int x, int y)
+{
+    if (files.isEmpty()) return;
+    if (sampR.contains (x, y))
+    {
+        const int first = jlimit (0, kSlots - 1, (x - sampR.getX() - 8) * kSlots / jmax (1, sampR.getWidth() - 16));
+        for (int k = 0; k < files.size() && first + k < kSlots; ++k)
+            loadSlot (first + k, File (files[k]));
+    }
+    else loadFile (File (files[0]));
 }
 
 void LiveFXEditor::timerCallback()
 {
     for (auto* k : knobs) if (k != nullptr) k->refresh();
+    for (int s = 0; s < kSlots; ++s)
+    {
+        const auto i = (size_t) s;
+        const String name = proc.getSlotName (s);
+        slotLoad[i]->setButtonText (name.isEmpty() ? "load sound..." : name);
+        const bool learning = proc.keyLearnSlot.load() == s;
+        const int key = proc.getSlotKey (s);
+        slotKey[i]->setButtonText (learning ? String ("press key...")
+                                            : "KEY: " + MidiMessage::getMidiNoteName (key, true, true, 3));
+        slotKey[i]->setColour (TextButton::buttonColourId, learning ? kOrange : getLookAndFeel().findColour (TextButton::buttonColourId));
+    }
     repaint();
 }
 
@@ -200,8 +258,9 @@ void LiveFXEditor::resized()
         auto c = content (looperR);
         waveR = c.removeFromTop (100);
         c.removeFromTop (6);
-        auto kn = c.removeFromRight (110);
-        knobs[LoopLevel]->setBounds (kn);
+        auto kn = c.removeFromRight (220);
+        knobs[LoopLevel]->setBounds (kn.removeFromLeft (110));
+        knobs[LoopStart]->setBounds (kn);
         auto top = c.removeFromTop (c.getHeight() / 2);
         row (top, { recBtn, stopBtn });
         row (c, { clearBtn, revBtn, loadBtn });
@@ -251,6 +310,26 @@ void LiveFXEditor::resized()
             stepSld[s]->setBounds (col.reduced (0, 4));
         }
     }
+    // key sampler
+    {
+        auto c = content (sampR);
+        const int w = c.getWidth() / kSlots;
+        for (size_t s = 0; s < (size_t) kSlots; ++s)
+        {
+            auto col = c.removeFromLeft (w).reduced (3, 0);
+            auto top = col.removeFromTop (30);
+            slotClear[s]->setBounds (top.removeFromRight (28));
+            slotLoad[s]->setBounds (top.withTrimmedRight (2));
+            col.removeFromTop (4);
+            auto r2 = col.removeFromTop (28);
+            slotGrab[s]->setBounds (r2.removeFromRight (50));
+            slotKey[s]->setBounds (r2.withTrimmedRight (2));
+            col.removeFromTop (4);
+            slotMode[s]->setBounds (col.removeFromTop (28));
+            col.removeFromTop (4);
+            slotLvl[s]->setBounds (col.removeFromTop (26));
+        }
+    }
 }
 
 void LiveFXEditor::paint (Graphics& g)
@@ -262,7 +341,7 @@ void LiveFXEditor::paint (Graphics& g)
         g.fillRoundedRectangle (r.toFloat(), 10.f);
         g.setColour (kAccent);
         g.setFont (15.f);
-        g.drawText (t, r.getX() + 12, r.getY() + 4, 320, 20, Justification::left);
+        g.drawText (t, r.getX() + 12, r.getY() + 4, r.getWidth() - 24, 20, Justification::left);
     };
     panel (looperR, "LIVE LOOPER");
     panel (granR,   "GRANULAR");
@@ -270,6 +349,7 @@ void LiveFXEditor::paint (Graphics& g)
     panel (reverbR, "REVERB");
     panel (fxR,     "FILTER / CRUSH / DRIVE / STUTTER");
     panel (seqR,    "STEP GATE SEQUENCER  (16 steps - toggle = on, slider = level)");
+    panel (sampR,   "KEY SAMPLER  -  LOAD a file or GRAB the loop (UI button or pad bank B, pads 1-8) into a slot, click KEY, press a key");
 
     // ---- looper window ----
     const int st = proc.loopState.load();
@@ -290,15 +370,27 @@ void LiveFXEditor::paint (Graphics& g)
             g.drawVerticalLine (waveR.getX() + x, (float) waveR.getCentreY() - h, (float) waveR.getCentreY() + h + 1.f);
         }
     }
-    double frac = 0.0;
+    double frac = 0.0, startFrac = 0.0;
     String label;
     if (st == LRec)      { frac = pos / (60.0 * sr); label = "RECORDING  " + String (pos / sr, 1) + " s"; }
     else if (st == LEmpty) label = "EMPTY - pad 1 = record, or load / drop an audio file";
     else
     {
-        frac = len > 0 ? pos / len : 0.0;
+        const bool rev = proc.apvts.getRawParameterValue ("loopRev")->load() > 0.5f;
+        const double sIdx = len > 0 ? jlimit (0.0, len - jmin (len, 1024.0), (double) proc.apvts.getRawParameterValue ("loopStart")->load() * len) : 0.0;
+        frac = len > 0 ? (rev ? len - 1.0 + sIdx - pos : pos) / len : 0.0;
+        startFrac = len > 0 ? sIdx / len : 0.0;
         label = String (st == LPlay ? "PLAYING" : st == LDub ? "OVERDUBBING" : "STOPPED")
                 + "   " + String (len / sr, 2) + " s loop";
+    }
+    if (st != LEmpty && st != LRec)
+    {
+        const int sx = waveR.getX() + (int) (startFrac * waveR.getWidth());
+        g.setColour (Colour (0xaa0b0d11));
+        g.fillRect (waveR.getX(), waveR.getY(), sx - waveR.getX(), waveR.getHeight());
+        g.setColour (kOrange);
+        g.drawVerticalLine (sx, (float) waveR.getY(), (float) waveR.getBottom());
+        g.fillRect (sx, waveR.getY(), 8, 5);
     }
     if (st != LEmpty)
     {
