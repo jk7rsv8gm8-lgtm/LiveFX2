@@ -32,10 +32,14 @@ static AudioProcessorValueTreeState::ParameterLayout createLayout()
     l.add (std::make_unique<AudioParameterBool> (ParameterID { "seqOn", 1 },     "Sequencer On", false));
     l.add (std::make_unique<AudioParameterBool> (ParameterID { "keysPitch", 1 }, "Keys To Grain Pitch", false));
     l.add (std::make_unique<AudioParameterBool> (ParameterID { "loopRev", 1 },   "Loop Reverse", false));
+    l.add (std::make_unique<AudioParameterChoice> (ParameterID { "psSize", 1 }, "PaulStretch Window", StringArray { "2048", "4096", "8192", "16384" }, 2));
+    l.add (std::make_unique<AudioParameterBool> (ParameterID { "psFreeze", 1 }, "PaulStretch Freeze", false));
 
     for (int s = 0; s < kSlots; ++s)
     {
-        l.add (std::make_unique<AudioParameterInt> (ParameterID { "smKey" + String (s + 1), 1 }, "Sample Key " + String (s + 1), 0, 127, kDefKeys[s]));
+        l.add (std::make_unique<AudioParameterInt> (ParameterID { "smLow" + String (s + 1), 1 }, "Zone Low " + String (s + 1), 0, 127, kDefKeys[s]));
+        l.add (std::make_unique<AudioParameterInt> (ParameterID { "smHigh" + String (s + 1), 1 }, "Zone High " + String (s + 1), 0, 127, kDefKeys[s]));
+        l.add (std::make_unique<AudioParameterInt> (ParameterID { "smRoot" + String (s + 1), 1 }, "Zone Root " + String (s + 1), 0, 127, kDefKeys[s]));
         l.add (std::make_unique<AudioParameterChoice> (ParameterID { "smMode" + String (s + 1), 1 }, "Sample Mode " + String (s + 1),
                                                        StringArray { "One-shot", "Gate", "Loop", "Pitched" }, 0));
         l.add (std::make_unique<AudioParameterFloat> (ParameterID { "smLvl" + String (s + 1), 1 }, "Sample Level " + String (s + 1), 0.f, 1.5f, 1.f));
@@ -75,6 +79,8 @@ LiveFXProcessor::LiveFXProcessor()
     pSeqOn    = apvts.getRawParameterValue ("seqOn");
     pKeys     = apvts.getRawParameterValue ("keysPitch");
     pLoopRev  = apvts.getRawParameterValue ("loopRev");
+    pPsSize     = apvts.getRawParameterValue ("psSize");
+    pPsFreeze   = apvts.getRawParameterValue ("psFreeze");
     pSeqDir     = apvts.getRawParameterValue ("seqDir");
     pSeqRatchet = apvts.getRawParameterValue ("seqRatchet");
     pSeqPitch   = apvts.getRawParameterValue ("seqPitch");
@@ -87,7 +93,9 @@ LiveFXProcessor::LiveFXProcessor()
     }
     for (int s = 0; s < kSlots; ++s)
     {
-        pSlotKey[s]  = apvts.getRawParameterValue ("smKey" + String (s + 1));
+        pSlotLow[s]  = apvts.getRawParameterValue ("smLow" + String (s + 1));
+        pSlotHigh[s] = apvts.getRawParameterValue ("smHigh" + String (s + 1));
+        pSlotRoot[s] = apvts.getRawParameterValue ("smRoot" + String (s + 1));
         pSlotMode[s] = apvts.getRawParameterValue ("smMode" + String (s + 1));
         pSlotLvl[s]  = apvts.getRawParameterValue ("smLvl" + String (s + 1));
     }
@@ -147,6 +155,7 @@ bool LiveFXProcessor::loadSlotFile (int slot, const File& f)
         pendingSlotRate[slot] = reader->sampleRate;
     }
     slotPending[slot] = true;
+    slotHas[slot] = true;
     {
         ScopedLock l (pathLock);
         slotPath[slot] = f.getFullPathName();
@@ -165,7 +174,8 @@ void LiveFXProcessor::clearSlot (int slot)
         pendingSlotRate[slot] = 44100.0;
     }
     slotPending[slot] = true;
-    { ScopedLock l (pathLock); slotPath[slot] = {}; slotLabel[slot] = {}; }
+    slotHas[slot] = false;
+    { ScopedLock l (pathLock); slotPath[slot] = String(); slotLabel[slot] = String(); }
 }
 
 String LiveFXProcessor::getSlotName (int slot) const
@@ -174,17 +184,20 @@ String LiveFXProcessor::getSlotName (int slot) const
     return slotLabel[slot];
 }
 
-// Audio thread: copy the loop (from the loop-start marker to the end, as heard - incl. reverse) into the staging buffer.
+// Audio thread: copy the loop region (loop start .. loop end, as heard - incl. reverse) into the staging buffer.
 void LiveFXProcessor::captureLoop (int slot)
 {
     const int st = loopState.load();
     if (capReady.load() || loopLen <= 0 || st == LEmpty || st == LRec) return;
-    const int len = loopLen - loopStartIdx;
+    const int minRegion = jmin (loopLen, 1024);
+    const int e = jlimit (minRegion, loopLen, (int) (pv[LoopEnd]->load() * (float) loopLen));
+    const int b = jlimit (0, e - minRegion, (int) (pv[LoopStart]->load() * (float) loopLen));
+    const int len = e - b;
     if (len < 64 || (size_t) len > capBuf[0].size()) return;
     const bool rev = pLoopRev->load() > 0.5f;
     for (int c = 0; c < 2; ++c)
         for (int k = 0; k < len; ++k)
-            capBuf[c][(size_t) k] = loopBuf[c][(size_t) (rev ? loopLen - 1 - k : loopStartIdx + k)];
+            capBuf[c][(size_t) k] = loopBuf[c][(size_t) (rev ? e - 1 - k : b + k)];
     capLen = len;
     capSlot = slot;
     capReady = true;
@@ -220,6 +233,7 @@ void LiveFXProcessor::pollCapture()
         pendingSlotRate[slot] = sr;
     }
     slotPending[slot] = true;
+    slotHas[slot] = true;
     { ScopedLock l (pathLock); slotPath[slot] = path; slotLabel[slot] = "from looper"; }
 }
 
@@ -275,28 +289,52 @@ void LiveFXProcessor::runSeqAction (int a)
     else if (a == 5) { for (int s = 1; s <= kSteps; ++s) set ("s" + String (s), 1.f); }   // FILL
 }
 
-// A key triggers the slot assigned to it. Keys without a slot play the first "Pitched" slot (if any).
+// Sets a slot's key zone (parameters only, so it is saved and automatable). mode < 0 keeps the current mode.
+void LiveFXProcessor::setSlotZone (int slot, int low, int high, int root, int mode)
+{
+    if (slot < 0 || slot >= kSlots) return;
+    low = jlimit (0, 127, low);
+    high = jlimit (low, 127, high);
+    root = jlimit (0, 127, root);
+    auto set = [this] (const String& id, float v)
+    {
+        if (auto* p = apvts.getParameter (id)) p->setValueNotifyingHost (p->convertTo0to1 (v));
+    };
+    const String n (slot + 1);
+    set ("smLow" + n, (float) low);
+    set ("smHigh" + n, (float) high);
+    set ("smRoot" + n, (float) root);
+    if (mode >= 0) set ("smMode" + n, (float) mode);
+}
+
+void LiveFXProcessor::previewNote (int note, bool down)
+{
+    if (note >= 0 && note < 128) pushCmd (2000 + note * 2 + (down ? 1 : 0));
+}
+
+// A key plays every slot whose zone (low..high) contains it. In "Pitched" mode the sound is transposed relative to the root key.
 bool LiveFXProcessor::sampleNoteOn (int note, float vel)
 {
-    int slot = -1;
-    for (int i = 0; i < kSlots && slot < 0; ++i)
-        if (slotLen[i] > 0 && (int) pSlotKey[i]->load() == note) slot = i;
-    for (int i = 0; i < kSlots && slot < 0; ++i)
-        if (slotLen[i] > 0 && (int) pSlotMode[i]->load() == SmPitched) slot = i;
-    if (slot < 0) return false;
+    bool any = false;
+    for (int slot = 0; slot < kSlots; ++slot)
+    {
+        if (slotLen[slot] <= 0) continue;
+        if (note < (int) pSlotLow[slot]->load() || note > (int) pSlotHigh[slot]->load()) continue;
 
-    Voice* v = nullptr;
-    for (auto& c : voices) if (! c.active) { v = &c; break; }
-    if (v == nullptr) v = &voices[(size_t) (stealIdx++ % kVoices)];
+        Voice* v = nullptr;
+        for (auto& c : voices) if (! c.active) { v = &c; break; }
+        if (v == nullptr) v = &voices[(size_t) (stealIdx++ % kVoices)];
 
-    const int mode = (int) pSlotMode[slot]->load();
-    const int root = (int) pSlotKey[slot]->load();
-    v->active = true; v->held = true; v->releasing = false;
-    v->slot = slot; v->note = note; v->mode = mode;
-    v->pos = 0.0; v->env = 0.f;
-    v->inc = slotRate[slot] / sr * (mode == SmPitched ? std::pow (2.0, (note - root) / 12.0) : 1.0);
-    v->gain = jmax (0.1f, vel) * pSlotLvl[slot]->load();
-    return true;
+        const int mode = (int) pSlotMode[slot]->load();
+        const int root = (int) pSlotRoot[slot]->load();
+        v->active = true; v->held = true; v->releasing = false;
+        v->slot = slot; v->note = note; v->mode = mode;
+        v->pos = 0.0; v->env = 0.f;
+        v->inc = slotRate[slot] / sr * (mode == SmPitched ? std::pow (2.0, (note - root) / 12.0) : 1.0);
+        v->gain = jmax (0.1f, vel) * pSlotLvl[slot]->load();
+        any = true;
+    }
+    return any;
 }
 
 void LiveFXProcessor::releaseNote (int note)
@@ -307,6 +345,86 @@ void LiveFXProcessor::releaseNote (int note)
             v.held = false;
             if (v.mode != SmOneShot) v.releasing = true;   // one-shots always play to the end
         }
+}
+
+// ------------------------------- PaulStretch ---------------------------------
+// Takes a window of the recent audio, keeps the FFT magnitudes, randomises the phases, and overlap-adds the result.
+// The read position advances 1/stretch as fast as real time, so sound is stretched into a slowly evolving drone.
+void LiveFXProcessor::psReset (int idx)
+{
+    psSizeIdxLast = idx;
+    const int N = 2048 << idx;
+    for (int c = 0; c < 2; ++c) std::fill (psAcc[c].begin(), psAcc[c].end(), 0.f);
+    for (int i = 0; i < N; ++i)
+        psWin[(size_t) i] = std::sin (MathConstants<float>::pi * ((float) i + 0.5f) / (float) N);   // sine window: 50 % overlap sums to 1
+    psPos = N / 2;                                  // makes the next sample compute a fresh block
+    psRead = (double) psW - (double) N;
+    if (psRead < 0.0) psRead += (double) psH;
+}
+
+void LiveFXProcessor::psNextBlock (int N, float stretch, bool frozen)
+{
+    const int hop = N / 2;
+    for (int c = 0; c < 2; ++c)                      // slide the overlap-add accumulators by one hop
+    {
+        float* a = psAcc[c].data();
+        std::copy (a + hop, a + N, a);
+        std::fill (a + hop, a + N, 0.f);
+    }
+    psPos = 0;
+
+    double lag = (double) psW - psRead;              // jump to "now" when the read position fell too far behind
+    if (lag < 0.0) lag += (double) psH;
+    if (! frozen && (lag > (double) (psH - N - 8) || lag < (double) N))
+    {
+        psRead = (double) psW - (double) N;
+        if (psRead < 0.0) psRead += (double) psH;
+    }
+
+    auto& fft = *psFft[(size_t) psSizeIdxLast];
+    const int start = (int) psRead;
+    for (int c = 0; c < 2; ++c)
+    {
+        const float* h = psHist[c].data();
+        double inEnergy = 0.0;
+        for (int i = 0; i < N; ++i)
+        {
+            int idx = start + i;
+            if (idx >= psH) idx -= psH;
+            const float x = h[idx] * psWin[(size_t) i];
+            psSpecIn[(size_t) i] = std::complex<float> (x, 0.f);
+            inEnergy += (double) x * (double) x;
+        }
+        fft.perform (psSpecIn.data(), psSpecOut.data(), false);
+
+        psSpecIn[0] = std::complex<float> (std::abs (psSpecOut[0]), 0.f);
+        psSpecIn[(size_t) hop] = std::complex<float> (std::abs (psSpecOut[(size_t) hop]), 0.f);
+        for (int k = 1; k < hop; ++k)                // keep magnitude, random phase (mirrored so the result is real)
+        {
+            const float mag = std::abs (psSpecOut[(size_t) k]);
+            const float ph = rng.nextFloat() * MathConstants<float>::twoPi;
+            const std::complex<float> v (mag * std::cos (ph), mag * std::sin (ph));
+            psSpecIn[(size_t) k] = v;
+            psSpecIn[(size_t) (N - k)] = std::conj (v);
+        }
+        fft.perform (psSpecIn.data(), psSpecOut.data(), true);
+
+        double outEnergy = 0.0;
+        for (int i = 0; i < N; ++i)
+        {
+            const float x = psSpecOut[(size_t) i].real() * psWin[(size_t) i];
+            psSpecIn[(size_t) i] = std::complex<float> (x, 0.f);      // scratch
+            outEnergy += (double) x * (double) x;
+        }
+        const float g = outEnergy > 1.0e-12 ? (float) std::sqrt (inEnergy / outEnergy) : 0.f;   // match the level of the input
+        float* a = psAcc[c].data();
+        for (int i = 0; i < N; ++i) a[i] += psSpecIn[(size_t) i].real() * g;
+    }
+    if (! frozen)
+    {
+        psRead += (double) hop / (double) jmax (1.f, stretch);
+        if (psRead >= (double) psH) psRead -= (double) psH;
+    }
 }
 
 bool LiveFXProcessor::isBusesLayoutSupported (const BusesLayout& l) const
@@ -343,6 +461,14 @@ void LiveFXProcessor::prepareToPlay (double sampleRate, int)
     for (auto& v : voices) v.active = false;
     for (int c = 0; c < 2; ++c) capBuf[c].assign ((size_t) loopMax, 0.f);
     capReady = false;
+    psH = (int) (15.0 * sr);
+    for (int c = 0; c < 2; ++c) { psHist[c].assign ((size_t) psH, 0.f); psAcc[c].assign (16384, 0.f); }
+    psWin.assign (16384, 0.f);
+    psSpecIn.assign (16384, std::complex<float> (0.f, 0.f));
+    psSpecOut.assign (16384, std::complex<float> (0.f, 0.f));
+    psFft.clear();
+    for (int i = 0; i < 4; ++i) psFft.push_back (std::make_unique<juce::dsp::FFT> (11 + i));
+    psW = 0; psPos = 0; psSizeIdxLast = -1; psRead = 0.0; psWasActive = false;
     reverb.setSampleRate (sr);
     reverb.reset();
 }
@@ -471,6 +597,7 @@ void LiveFXProcessor::handleMidi (MidiBuffer& midi)
         else if (m.isNoteOn())
         {
             int note = m.getNoteNumber();
+            if (m.getChannel() != kPadChannel) noteHeld[note] = true;
             if (m.getChannel() == kPadChannel)
             {
                 if (note >= kPadBaseNote && note < kPadBaseNote + 8) padEvent (note - kPadBaseNote, true);           // pad bank A: looper / FX
@@ -488,8 +615,7 @@ void LiveFXProcessor::handleMidi (MidiBuffer& midi)
                 const int ls = keyLearnSlot.load();
                 if (ls >= 0)   // "KEY" button was pressed in the UI: this key is assigned to that slot
                 {
-                    if (auto* p = apvts.getParameter ("smKey" + String (ls + 1)))
-                        p->setValueNotifyingHost (p->convertTo0to1 ((float) note));
+                    setSlotZone (ls, note, note, note);   // the zone becomes this single key
                     keyLearnSlot = -1;
                 }
                 else if (! sampleNoteOn (note, m.getFloatVelocity()))
@@ -499,6 +625,7 @@ void LiveFXProcessor::handleMidi (MidiBuffer& midi)
         else if (m.isNoteOff())
         {
             const int note = m.getNoteNumber();
+            if (m.getChannel() != kPadChannel) noteHeld[note] = false;
             if (m.getChannel() == kPadChannel)
             {
                 if (note >= kPadBaseNote && note < kPadBaseNote + 8) padEvent (note - kPadBaseNote, false);
@@ -583,7 +710,12 @@ void LiveFXProcessor::processBlock (AudioBuffer<float>& buf, MidiBuffer& midi)
         if (n1 <= 0) break;
         int v = fifoData[s1];
         fifo.finishedRead (1);
-        if (v >= 1000) captureLoop (v - 1000);
+        if (v >= 2000)
+        {
+            const int nt = (v - 2000) >> 1;
+            if ((v & 1) != 0) sampleNoteOn (nt, 0.8f); else releaseNote (nt);
+        }
+        else if (v >= 1000) captureLoop (v - 1000);
         else padEvent (v >> 1, (v & 1) != 0);
     }
 
@@ -606,9 +738,15 @@ void LiveFXProcessor::processBlock (AudioBuffer<float>& buf, MidiBuffer& midi)
     const float depth = P (SeqDepth);
     const double stepSamples = 60.0 / curBpm * kSeqBeats[jlimit (0, 3, (int) pSeqRate->load())] * sr;
     const bool rev = pLoopRev->load() > 0.5f;
-    {   // loop start point: playback and overdub run from here to the end, then wrap back to here
+    {   // loop region: playback and overdub run from Loop Start to Loop End, then wrap back to the start
         const int minRegion = jmin (loopLen, 1024);
-        loopStartIdx = loopLen > 0 ? jlimit (0, loopLen - minRegion, (int) (P (LoopStart) * (float) loopLen)) : 0;
+        if (loopLen > 0)
+        {
+            const int e = jlimit (minRegion, loopLen, (int) (P (LoopEnd) * (float) loopLen));
+            loopEndIdx = e;
+            loopStartIdx = jlimit (0, e - minRegion, (int) (P (LoopStart) * (float) loopLen));
+        }
+        else { loopStartIdx = 0; loopEndIdx = 0; }
     }
     const float outLvl = P (OutLevel);
     const float gateCoef = 1.f - std::exp (-1.f / (0.002f * (float) sr));
@@ -657,6 +795,15 @@ void LiveFXProcessor::processBlock (AudioBuffer<float>& buf, MidiBuffer& midi)
     }
     lastSeqOn = seqOn;
 
+    // PaulStretch settings
+    const int psIdx = jlimit (0, 3, (int) pPsSize->load());
+    const int psSizeN = 2048 << psIdx, psHopN = psSizeN / 2;
+    const float psMix = P (PsMix), psStretch = P (PsStretch);
+    const bool psFrozen = pPsFreeze->load() > 0.5f;
+    const bool psActive = psMix > 0.001f;
+    if (psIdx != psSizeIdxLast || (! psActive && psWasActive)) psReset (psIdx);   // new window size, or switched off
+    psWasActive = psActive;
+
     const float grainGain = 1.f / std::sqrt (jmax (1.f, grDens * grSizeMs * 0.001f));
     const float bits = 16.f - crushAmt * 12.f;
     const float levels = std::pow (2.f, bits - 1.f);
@@ -701,19 +848,19 @@ void LiveFXProcessor::processBlock (AudioBuffer<float>& buf, MidiBuffer& midi)
         {
             loopBuf[0][(size_t) loopPos] = inL;
             loopBuf[1][(size_t) loopPos] = inR;
-            if (++loopPos >= loopMax) { loopLen = loopMax; loopPos = 0; loopState = LPlay; computePeaks(); }
+            if (++loopPos >= loopMax) { loopLen = loopMax; loopEndIdx = loopLen; loopStartIdx = 0; loopPos = 0; loopState = LPlay; computePeaks(); }
         }
         else if ((st == LPlay || st == LDub) && loopLen > 0)
         {
-            if (loopPos < loopStartIdx || loopPos >= loopLen) loopPos = loopStartIdx;
-            const size_t idx = (size_t) (rev ? loopLen - 1 + loopStartIdx - loopPos : loopPos);
+            if (loopPos < loopStartIdx || loopPos >= loopEndIdx) loopPos = loopStartIdx;
+            const size_t idx = (size_t) (rev ? loopEndIdx - 1 + loopStartIdx - loopPos : loopPos);
             lpL = loopBuf[0][idx]; lpR = loopBuf[1][idx];
             if (st == LDub)
             {
                 loopBuf[0][idx] = std::tanh (lpL + inL);
                 loopBuf[1][idx] = std::tanh (lpR + inR);
             }
-            if (++loopPos >= loopLen) loopPos = loopStartIdx;
+            if (++loopPos >= loopEndIdx) loopPos = loopStartIdx;
         }
         float xL = inL + lpL * loopLvl, xR = inR + lpR * loopLvl;
 
@@ -782,6 +929,20 @@ void LiveFXProcessor::processBlock (AudioBuffer<float>& buf, MidiBuffer& midi)
                 return ftype == 0 ? v2 : (ftype == 1 ? x - fk * v1 - v2 : fk * v1);
             };
             xL = svf (fl[0], xL); xR = svf (fl[1], xR);
+        }
+
+        // ---- PaulStretch (history is not written while frozen, so the frozen moment stays intact) ----
+        if (! psFrozen)
+        {
+            psHist[0][(size_t) psW] = xL; psHist[1][(size_t) psW] = xR;
+            if (++psW >= psH) psW = 0;
+        }
+        if (psActive)
+        {
+            if (psPos >= psHopN) psNextBlock (psSizeN, psStretch, psFrozen);
+            xL = xL * (1.f - psMix) + psAcc[0][(size_t) psPos] * psMix;
+            xR = xR * (1.f - psMix) + psAcc[1][(size_t) psPos] * psMix;
+            ++psPos;
         }
 
         // ---- granular ----

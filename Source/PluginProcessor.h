@@ -1,5 +1,6 @@
 #pragma once
 #include <JuceHeader.h>
+#include <complex>
 
 // ---------------------------------------------------------------------------
 //  Performance settings - edit these to match your MiniLab 3 setup
@@ -10,6 +11,8 @@ constexpr int kSteps       = 16;
 constexpr int kPeaks       = 256;
 constexpr int kSlots       = 8;    // key-sampler slots
 constexpr int kVoices      = 16;   // key-sampler polyphony
+constexpr int kNoteLo      = 24;   // lowest / highest key shown on the on-screen piano
+constexpr int kNoteHi      = 96;
 constexpr int kActions     = 6;    // sequencer one-shot actions (randomize, mutate, shift, clear, fill)
 inline constexpr const char* kActionNames[kActions] = { "RANDOMIZE", "MUTATE", "SHIFT <", "SHIFT >", "CLEAR", "FILL" };
 
@@ -17,13 +20,14 @@ inline constexpr const char* kActionNames[kActions] = { "RANDOMIZE", "MUTATE", "
 // with MIDI learn (right-click a knob in the plugin window).
 struct PDef { const char* id; const char* name; float lo, hi, def, mid; int cc; };
 
-enum PIdx { LoopLevel, LoopStart, GrMix, GrSize, GrPitch, GrDens, GrPos, GrSpray,
+enum PIdx { LoopLevel, LoopStart, LoopEnd, GrMix, GrSize, GrPitch, GrDens, GrPos, GrSpray,
             DlMix, DlTime, DlFb, DlTone, RvMix, RvSize, RvDamp,
-            FltCut, FltRes, Crush, Drive, SeqDepth, SeqLen, SeqSwing, SeqGate, SeqProb, OutLevel, NumP };
+            FltCut, FltRes, Crush, Drive, PsMix, PsStretch, SeqDepth, SeqLen, SeqSwing, SeqGate, SeqProb, OutLevel, NumP };
 
 inline constexpr PDef kParams[NumP] = {
     { "loopLevel", "Loop Level",     0.f,   1.f,    0.8f,   -1.f,   -1 },
     { "loopStart", "Loop Start",     0.f,   1.f,    0.f,    -1.f,   -1 },
+    { "loopEnd",   "Loop End",       0.f,   1.f,    1.f,    -1.f,   -1 },
     { "grMix",     "Grain Mix",      0.f,   1.f,    0.f,    -1.f,   74 },
     { "grSize",    "Grain Size",     10.f,  500.f,  120.f,  100.f,  71 },
     { "grPitch",   "Grain Pitch",    -24.f, 24.f,   0.f,    -1.f,   76 },
@@ -41,6 +45,8 @@ inline constexpr PDef kParams[NumP] = {
     { "fltRes",    "Filter Reso",    0.5f,  10.f,   0.7f,   -1.f,   -1 },
     { "crush",     "Crusher",        0.f,   1.f,    0.f,    -1.f,   16 },
     { "drive",     "Drive",          0.f,   1.f,    0.f,    -1.f,   -1 },
+    { "psMix",     "PaulStretch Mix",0.f,   1.f,    0.f,    -1.f,   -1 },
+    { "psStretch", "Stretch",        1.f,   100.f,  8.f,    10.f,   -1 },
     { "seqDepth",  "Seq Depth",      0.f,   1.f,    1.f,    -1.f,   -1 },
     { "seqLen",    "Seq Length",     1.f,   16.f,   16.f,   -1.f,   -1 },
     { "seqSwing",  "Swing",          0.f,   1.f,    0.f,    -1.f,   -1 },
@@ -94,7 +100,15 @@ public:
     bool loadSlotFile (int slot, const juce::File&);     // message thread
     void clearSlot (int slot);                           // message thread
     juce::String getSlotName (int slot) const;
-    int getSlotKey (int slot) const { return (int) pSlotKey[slot]->load(); }
+    // key zones: every slot plays its sound on the keys low..high (pitched relative to root in "Pitched" mode)
+    int getSlotLow (int s) const  { return (int) pSlotLow[s]->load(); }
+    int getSlotHigh (int s) const { return (int) pSlotHigh[s]->load(); }
+    int getSlotRoot (int s) const { return (int) pSlotRoot[s]->load(); }
+    int getSlotMode (int s) const { return (int) pSlotMode[s]->load(); }
+    bool isSlotLoaded (int s) const { return slotHas[s].load(); }
+    void setSlotZone (int slot, int low, int high, int root, int mode = -1);   // sets parameters only (any thread)
+    void previewNote (int note, bool down);                                    // on-screen piano -> sampler
+    std::atomic<bool> noteHeld[128] {};                                        // keys held on the MIDI keyboard
     std::atomic<int> keyLearnSlot { -1 };                // slot waiting for a key press
     void grabLoopToSlot (int slot);                      // copy the current loop into a key slot (from the UI)
 
@@ -110,7 +124,8 @@ private:
     std::atomic<bool> hasPending { false };
 
     // key sampler data. slotBuf/slotRate/slotLen belong to the audio thread; new samples arrive via pending*.
-    std::atomic<float> *pSlotKey[kSlots] {}, *pSlotMode[kSlots] {}, *pSlotLvl[kSlots] {};
+    std::atomic<float> *pSlotLow[kSlots] {}, *pSlotHigh[kSlots] {}, *pSlotRoot[kSlots] {}, *pSlotMode[kSlots] {}, *pSlotLvl[kSlots] {};
+    std::atomic<bool> slotHas[kSlots] {};
     juce::AudioBuffer<float> slotBuf[kSlots], pendingSlotBuf[kSlots];
     double slotRate[kSlots] {}, pendingSlotRate[kSlots] {};
     int slotLen[kSlots] {};
@@ -139,6 +154,8 @@ private:
     void spawnGrain (float sizeMs, float pitch, float posKnob, float spray);
     bool sampleNoteOn (int note, float vel);
     void releaseNote (int note);
+    void psReset (int sizeIdx);
+    void psNextBlock (int N, float stretch, bool frozen);
     void pushCmd (int v);
     void captureLoop (int slot);      // audio thread: copy the loop into the staging buffer
     void pollCapture();               // message thread: turn the staging buffer into a key sound
@@ -161,7 +178,7 @@ private:
 
     // looper
     std::vector<float> loopBuf[2];
-    int loopMax = 0, loopLen = 0, loopPos = 0, loopStartIdx = 0;
+    int loopMax = 0, loopLen = 0, loopPos = 0, loopStartIdx = 0, loopEndIdx = 0;
 
     // history for stutter
     std::vector<float> hBuf[2];
@@ -192,6 +209,15 @@ private:
     double accum = 0.0, curLen = 1000.0;
     bool lastSeqOn = false, stepActive = true;
     float gateSm = 1.f, stepLevel = 1.f, seqPitchSt = 0.f;
+
+    // PaulStretch: random-phase FFT time stretch of the last seconds of audio (window sizes 2048..16384)
+    std::vector<std::unique_ptr<juce::dsp::FFT>> psFft;
+    std::vector<float> psHist[2], psAcc[2], psWin;
+    std::vector<std::complex<float>> psSpecIn, psSpecOut;
+    int psH = 0, psW = 0, psPos = 0, psSizeIdxLast = -1;
+    double psRead = 0.0;
+    bool psWasActive = false;
+    std::atomic<float> *pPsSize {}, *pPsFreeze {};
 
     juce::Reverb reverb;
 
